@@ -1,0 +1,1371 @@
+---
+title: "Geocoding Getuigenissen"
+output: 
+  flexdashboard::flex_dashboard:
+    orientation: rows
+    vertical_layout: fill
+    logo: https://avatars3.githubusercontent.com/u/62653831?s=30&v=4
+    theme: bootstrap
+runtime: shiny
+---
+
+```{r setup, include=FALSE}
+library(flexdashboard)
+library(shinyWidgets)
+library(shiny)
+library(DT)
+library(leaflet)
+library(sf)
+library(leaflet.extras)
+library(leaflet.extras2)
+library(leafgl)
+library(mapedit)
+library(mapview)
+library(leafpm)
+library(rgeos)
+library(BelgiumMaps.StatBel)
+library(sp)
+library(data.table)
+library(stringdist)
+library(RPostgreSQL)
+library(tools)
+library(glue)
+library(zip)
+DBconnection <- function(){
+  library(RPostgreSQL)
+  con <- dbConnect(drv = PostgreSQL(), 
+                   user = Sys.getenv("GETUIGENISSEN_GEOCODING_USER"), 
+                   dbname = Sys.getenv("GETUIGENISSEN_GEOCODING_DB"), 
+                   password = Sys.getenv("GETUIGENISSEN_GEOCODING_PWD"), 
+                   host = Sys.getenv("GETUIGENISSEN_GEOCODING_HOST"),
+                   port = Sys.getenv("GETUIGENISSEN_GEOCODING_PORT")) 
+  con
+}
+save_annotation <- function(x, modus = TRUE, comment = "OK", datasource = dashdata$filenaam){
+  con <- DBconnection()
+  on.exit(dbDisconnect(con))
+  x$modus <- ifelse(modus, "test", "prod")
+  x$comment <- comment
+  x$datasource <- datasource
+  colnames(x) <- tolower(colnames(x))
+  dbWriteTable(con, name = c("getuigenissen", "locations_geocoded"), value = x, overwrite = FALSE, append = TRUE, row.names = FALSE)
+}
+delete_annotation <- function(x){
+  con <- DBconnection()
+  on.exit(dbDisconnect(con))
+  qry <- sprintf("DELETE FROM getuigenissen.locations_geocoded WHERE datasource = '%s' AND doc_id = '%s' AND chunk_id = '%s' AND modus = '%s'",
+                 x$datasource, x$doc_id, x$chunk_id, x$modus)
+  print(qry)
+  result <- dbGetQuery(con, qry)
+  result
+}
+read_annotations <- function(chunk_text = NULL, with_filters = TRUE){
+  con <- DBconnection()
+  on.exit(dbDisconnect(con))
+  if(is.null(chunk_text) || length(chunk_text) == 0){
+    x <- st_read(con, layer = c("getuigenissen", "locations_geocoded"), as_tibble = FALSE)  
+  }else{
+    sql <- glue_sql("SELECT * FROM getuigenissen.locations_geocoded WHERE chunk_text IN ({locations*})", 
+                    locations = chunk_text, .con = con)
+    x <- st_read(con, query = sql)  
+  }
+  if(nrow(x) > 0 && with_filters){
+    x <- subset(x, comment %in% "gazetteer" | datasource %in% dashdata$filenaam)
+    x <- subset(x, modus %in% "prod")  
+    #c("LINESTRING", "POINT", "POLYGON")
+  }
+  x
+}
+read_gazetteers <- function(){
+  con <- DBconnection()
+  on.exit(dbDisconnect(con))
+  x <- dbGetQuery(con, "select modus, datasource, chunk_text, label, spatial_id, comment FROM getuigenissen.locations_geocoded WHERE is_generieke_locatie = true")
+  if(nrow(x) > 0){
+    x <- subset(x, comment %in% "gazetteer" | datasource %in% dashdata$filenaam)
+    x <- subset(x, modus %in% "prod")  
+    x <- x[order(x$comment %in% "gazetteer", decreasing = TRUE), ]
+  }
+  x
+}
+read_datasources <- function(){
+  con <- DBconnection()
+  on.exit(dbDisconnect(con))
+  x <- st_read(con, 
+               query = "SELECT modus, datasource, count(*) as n FROM getuigenissen.locations_geocoded where datasource is not null group by modus, datasource order by datasource, modus")
+  if(nrow(x) == 0){
+    x <- data.frame(modus = character(), datasource = character(), stringsAsFactors = FALSE)
+  }
+  x
+}
+read_manual_annotations <- function(){
+  con <- DBconnection()
+  on.exit(dbDisconnect(con))
+  x <- st_read(con, 
+               query = "SELECT modus, datasource, shape_id, chunk_text as label, type, geometry, comment FROM getuigenissen.locations_geocoded WHERE type = 'manual'")
+  x$LABEL <- x$label
+  if(nrow(x) > 0){
+    x <- subset(x, datasource %in% dashdata$filenaam)
+    x <- subset(x, modus %in% "prod")    
+  }
+  x
+}
+update_maps_manual <- function(){
+  areas                <- read_manual_annotations()
+  if(nrow(areas) > 0){
+    areas$geom_type <- as.character(st_geometry_type(areas))
+    areas           <- split(areas[c("shape_id", "LABEL", "type", "geometry")], areas$geom_type)
+    if("POINT" %in% names(areas)){
+      dashdata$maps$manual_points <<- as_Spatial(areas$POINT)
+    }else{
+      dashdata$maps$manual_points <<- NULL
+    }
+    if("POLYGON" %in% names(areas)){
+      dashdata$maps$manual_polygons <<- as_Spatial(areas$POLYGON)
+    }else{
+      dashdata$maps$manual_polygons <<- NULL
+    }
+    if("LINESTRING" %in% names(areas)){
+      dashdata$maps$manual_lines <<- as_Spatial(areas$LINESTRING)
+    }else{
+      dashdata$maps$manual_lines <<- NULL
+    }
+  }
+  invisible()
+}
+txt_recode <- function (x, from = c(), to = c(), na.rm = FALSE) {
+  recode <- function (x, from, to) {
+    to[match(x, from)]
+  }
+  if (length(x) == 0) {
+    return(x)
+  }
+  stopifnot(length(from) == length(to))
+  if (na.rm) {
+    return(recode(x = x, from = from, to = to))
+  }
+  nongiven <- unique(x[!is.na(x)])
+  nongiven <- setdiff(nongiven, from)
+  if (length(nongiven) > 0) {
+    from <- append(x = from, values = nongiven)
+    to   <- append(x = to, values = nongiven)
+  }
+  to[match(x, from)]
+}
+
+
+## Geographical data
+data("BE_ADMIN_PROVINCE", package = "BelgiumMaps.StatBel")
+data("BE_ADMIN_DISTRICT", package = "BelgiumMaps.StatBel")
+data("BE_ADMIN_MUNTY",    package = "BelgiumMaps.StatBel")
+data("BE_ADMIN_SECTORS",  package = "BelgiumMaps.StatBel")
+BE_ADMIN_PROVINCE$shape_id  <- BE_ADMIN_PROVINCE$CD_PROV_REFNIS
+BE_ADMIN_PROVINCE$LABEL     <- sprintf("%s - %s", BE_ADMIN_PROVINCE$TX_PROV_DESCR_NL, BE_ADMIN_PROVINCE$TX_PROV_DESCR_FR)
+BE_ADMIN_DISTRICT$shape_id  <- BE_ADMIN_DISTRICT$CD_DSTR_REFNIS
+BE_ADMIN_MUNTY$shape_id     <- BE_ADMIN_MUNTY$CD_MUNTY_REFNIS
+BE_ADMIN_MUNTY$LABEL        <- sprintf("%s - %s", BE_ADMIN_MUNTY$TX_MUNTY_DESCR_NL,
+                                       BE_ADMIN_MUNTY$TX_MUNTY_DESCR_FR)
+BE_ADMIN_SECTORS$shape_id   <- BE_ADMIN_SECTORS$objectid
+BE_ADMIN_SECTORS$LABEL      <- sprintf("%s - %s", BE_ADMIN_SECTORS$TX_SECTOR_DESCR_NL,
+                                       BE_ADMIN_SECTORS$TX_SECTOR_DESCR_FR)
+vlaanderen            <- BE_ADMIN_DISTRICT 
+vlaanderen            <- subset(vlaanderen, TX_RGN_DESCR_NL %in% "Vlaams Gewest")
+vlaanderen$LABEL      <- vlaanderen$TX_ADM_DSTR_DESCR_NL
+westvlaanderen        <- subset(BE_ADMIN_SECTORS, TX_PROV_DESCR_NL %in% "Provincie West-Vlaanderen")
+westvlaanderen$LABEL  <- westvlaanderen$TX_SECTOR_DESCR_NL
+brugge_omgeving       <- subset(BE_ADMIN_SECTORS, TX_ADM_DSTR_DESCR_NL %in% "Arrondissement Brugge")
+brugge_omgeving$LABEL <- brugge_omgeving$TX_MUNTY_DESCR_NL
+brugge                <- subset(BE_ADMIN_SECTORS, TX_MUNTY_DESCR_NL %in% "Brugge")
+brugge$LABEL          <- brugge$TX_SECTOR_DESCR_NL
+bruggecentrum         <- subset(BE_ADMIN_SECTORS, TX_MUNTY_DESCR_NL %in% "Brugge")
+bruggecentrum$LABEL   <- bruggecentrum$TX_SECTOR_DESCR_NL
+basisachtergrond      <- subset(BE_ADMIN_SECTORS, TX_MUNTY_DESCR_NL %in% "Brugge")
+bbbox <- structure(c(xmin = 3.205804, ymin = 51.194524, xmax = 3.249331, ymax = 51.225888), 
+                   class = "bbox", crs = structure(list(input = "EPSG:4326", 
+    wkt = "GEOGCRS[\"WGS 84\",\n    DATUM[\"World Geodetic System 1984\",\n        ELLIPSOID[\"WGS 84\",6378137,298.257223563,\n            LENGTHUNIT[\"metre\",1]]],\n    PRIMEM[\"Greenwich\",0,\n        ANGLEUNIT[\"degree\",0.0174532925199433]],\n    CS[ellipsoidal,2],\n        AXIS[\"geodetic latitude (Lat)\",north,\n            ORDER[1],\n            ANGLEUNIT[\"degree\",0.0174532925199433]],\n        AXIS[\"geodetic longitude (Lon)\",east,\n            ORDER[2],\n            ANGLEUNIT[\"degree\",0.0174532925199433]],\n    USAGE[\n        SCOPE[\"unknown\"],\n        AREA[\"World\"],\n        BBOX[-90,-180,90,180]],\n    ID[\"EPSG\",4326]]"), class = "crs"))
+bbbox <- st_bbox(bbbox)
+bbbox <- matrix(c(xmin = 3.205804, ymin = 51.194524, xmax = 3.249331, ymax = 51.225888), 
+                nrow = 2, dimnames = list(c("x", "y"), c("min", "max")))
+bbbox <- bbox2SP(n = 51.225888, s = 51.194524, w = 3.205804, e = 3.249331, proj4string = bruggecentrum@proj4string)
+bbbox <- st_as_sf(bbbox)
+#bruggecentrum <- gIntersection(bruggecentrum, bbbox, byid = T)
+bruggecentrum <- st_as_sf(bruggecentrum)
+bruggecentrum <- st_intersection(bruggecentrum, bbbox)
+bruggecentrum <- as_Spatial(bruggecentrum)
+
+basisachtergrond_bruggecentrum <- st_as_sf(basisachtergrond)
+basisachtergrond_bruggecentrum <- st_intersection(basisachtergrond_bruggecentrum, bbbox)
+basisachtergrond_bruggecentrum <- as_Spatial(basisachtergrond_bruggecentrum)
+
+dashdata <- list()
+if(.Platform$OS.type == "unix") {
+  dashdata$root_maps <- "/srv/shiny-server"
+  dashdata$root_maps <- Sys.getenv("GETUIGENISSEN_GEOCODING_HOME")
+  #dashdata$root_maps <- "/home/jwijffels/getuigenissen"
+}else {
+  dashdata$root_maps <- "C:/Users/Jan/Desktop"
+  dashdata$root_maps <- "C:/Users/Jan/Vrije Universiteit Brussel/Getuigenissen - Documenten/Data-Verwerking/Getuigenissen/src/geo/geocoder-app"
+}
+dashdata$kaart <- vlaanderen
+dashdata$filenaam <- "default"
+dashdata$wms_link <- "https://geoservices.informatievlaanderen.be/raadpleegdiensten/histcart/wms"
+dashdata$file <- "default"
+dashdata$save_as <- tempfile(pattern = sprintf("tagged_%s", format(Sys.time(), "%Y%m%d_%H%M%S")), fileext = ".rds")
+dashdata$maps <- list()
+dashdata$maps$statistical_provincies <- BE_ADMIN_PROVINCE
+dashdata$maps$statistical_sectors <- BE_ADMIN_SECTORS
+dashdata$maps$statistical_gemeentes <- BE_ADMIN_MUNTY
+dashdata$maps$vlaanderen <- vlaanderen
+dashdata$maps$westvlaanderen <- westvlaanderen
+dashdata$maps$brugge_omgeving <- brugge_omgeving
+dashdata$maps$brugge <- brugge
+dashdata$maps$bruggecentrum <- bruggecentrum
+dashdata$maps$basisachtergrond <- basisachtergrond
+dashdata$maps$basisachtergrond_bruggecentrum <- basisachtergrond_bruggecentrum
+dashdata$maps$erfgoed_magis <- readRDS(file.path(dashdata$root_maps, "erfgoed_magis.rds"))
+dashdata$maps$gemeenten_1830 <- readRDS(file.path(dashdata$root_maps, "gemeenten_1830.rds"))
+dashdata$maps$gemeentecentra_1801 <- readRDS(file.path(dashdata$root_maps, "gemeentecentra_1801.rds"))
+dashdata$maps$straten_17de_eeuw <- readRDS(file.path(dashdata$root_maps, "straten_17de_eeuw.rds"))
+dashdata$maps$popp <- readRDS(file.path(dashdata$root_maps, "popp.rds"))
+dashdata$maps$straten_17de_eeuw <- subset(dashdata$maps$straten_17de_eeuw, 
+                                          shape_type %in% setdiff(c("water", "gebouwen", "straten", "bouwblokken1670", "parochies"), "bouwblokken1670"))
+dashdata$maps$straten_17de_eeuw <- dashdata$maps$straten_17de_eeuw[order(dashdata$maps$straten_17de_eeuw$shape_type %in% "parochies", decreasing = TRUE), ]
+dashdata$maps$stedenatlas_brugge <- read_annotations(with_filters = FALSE) 
+dashdata$maps$stedenatlas_brugge <- subset(dashdata$maps$stedenatlas_brugge, datasource %in% "geo_stedenatlas.rds"  & dashdata$maps$stedenatlas_brugge$modus %in% "prod")
+dashdata$maps$stedenatlas_brugge$LABEL <- dashdata$maps$stedenatlas_brugge$chunk_text
+dashdata$maps$stedenatlas_brugge <- st_centroid(dashdata$maps$stedenatlas_brugge)
+dashdata$maps$stedenatlas_brugge <- st_as_sf(dashdata$maps$stedenatlas_brugge)
+dashdata$maps <- lapply(dashdata$maps, FUN = function(x){
+  x <- x[, intersect(c("shape_id", "LABEL", "shape_type"), names(x))]
+  x$LABEL <- ifelse(is.na(x$LABEL), "Unknown", x$LABEL)
+  x
+})
+dashdata$maps <- Map(names(dashdata$maps), dashdata$maps, f=function(type, x){
+  x$type <- type
+  x
+})
+dashdata$bbox <- lapply(dashdata$maps[c("bruggecentrum", "brugge", "brugge_omgeving", "westvlaanderen", "vlaanderen")], 
+                        FUN = function(x) gEnvelope(x))
+rm(vlaanderen, westvlaanderen, brugge_omgeving, brugge, bruggecentrum, basisachtergrond, basisachtergrond_bruggecentrum)
+dashdata$rawdata <- data.frame(doc_id = c("doc1", "doc2", "doc2"), 
+                chunk_id = c(1, 1, 2),
+                chunk_text = c("Steenstraat", "Taj Mahal", "Mount Everest"),
+                text = c("We gingen naar de Steenstraat shoppen", 
+                         "I went to see the Taj Mahal after climbing the Mount Everest",
+                         "I went to see the Taj Mahal after climbing the Mount Everest"), 
+                is_done = rep(FALSE, 3),
+                stringsAsFactors = FALSE)
+dashdata$current_row <- 0
+dashdata$total_rows <- nrow(dashdata$rawdata)
+dashdata$locations_geocoded <- NULL
+current_rds <- reactiveVal(value = "startup")
+clickedsave <- reactiveVal(value = 0)
+selectedspatialobjects <- reactiveValues(data = NULL)
+```
+
+# Geocodeer locaties
+
+## Inputs {.sidebar}
+
+#### Geocodeer
+
+```{r}
+materialSwitch(inputId = "ui_testmodus", label = "Probeer - in test modus", status = "danger", value = FALSE)
+```
+
+```{r}
+renderUI({
+  current <- currentText()
+  current$chunk_text
+  HTML(sprintf('<font color=\"#FF0000\"><b>%s</b></font>', current$chunk_text))
+})
+```
+
+```{r}
+renderUI({
+  current <- currentText()
+  if(length(current$doc_id) == 0){
+    current$doc_id <- "no-more-documents"
+    current$row <- 0
+  }
+  HTML(sprintf("text %s/%s<br>doc: %s", #clickedsave(),
+               current$row, 
+               current$total_rows, current$doc_id))
+  tags$ul(
+          tags$li(sprintf("text %s/%s", current$row, current$total_rows)), 
+          tags$li(sprintf("doc %s", current$doc_id)))
+})
+tags$hr()
+```
+
+
+```{r}
+currentText <- reactive({
+  #input$ui_save
+  aantal <- clickedsave()
+  current_rds()
+  highlight_most_similar$data <<- NULL
+  chunk_text <- character()
+  text       <- character()
+  doc_id     <- character()
+  chunk_id   <- integer()
+  
+  while(dashdata$current_row <= nrow(dashdata$rawdata)){
+    dashdata$current_row <<- dashdata$current_row + 1
+    print(dashdata$current_row)
+    if(dashdata$current_row <= nrow(dashdata$rawdata)){
+      chunk_id   <- dashdata$rawdata$chunk_id[dashdata$current_row]
+      chunk_text <- dashdata$rawdata$chunk_text[dashdata$current_row]
+      text       <- dashdata$rawdata$text[dashdata$current_row]
+      doc_id     <- dashdata$rawdata$doc_id[dashdata$current_row]  
+      is_done    <- dashdata$rawdata$is_done[dashdata$current_row] 
+      if(is_done){
+        next
+      }
+      present <- read_annotations(chunk_text)
+      idx     <- which(present$doc_id %in% doc_id & present$chunk_id %in% chunk_id, present$chunk_text %in% chunk_text)
+      idx     <- unique(c(idx, which(present$is_generieke_locatie == TRUE & !is.na(present$shape_id))))
+      present <- present[idx, ]
+      if(nrow(present) == 0){
+        break
+      }else{
+        if(nchar(chunk_text) > 0 && !is_done){
+          showNotification(sprintf("%s was already geocoded and stored in the DB, skipping", chunk_text)) 
+        }
+      }
+    }else{
+      chunk_text <- character()
+      text       <- character()
+      doc_id     <- character()
+      chunk_id   <- integer()
+      if(nrow(dashdata$rawdata) > 0){
+        showModal(modalDialog(title = "Data selection",
+                              sprintf("Finished going through all %s records of the provided data.\nPlease upload more data",
+                                      nrow(dashdata$rawdata))))
+      }
+    }
+    
+  }
+  if(dashdata$current_row > 0){
+    showModal(modalDialog(title = "Kunt u deze plaats aanduiden op de kaart?",
+                          HTML(sprintf('<font color=\"#FF0000\"><b>%s</b></font>', chunk_text)), #footer = modalButton("Ja"),
+                          easyClose = TRUE, size = "m"))
+    #updateSearchInput(session, inputId = "ui_geocode_zoek", value = chunk_text)
+    updateTextInput(session, inputId = "ui_geocode_zoektext", value = chunk_text)
+  }
+  info <- list(doc_id = doc_id,
+               chunk_id = chunk_id,
+               chunk_text = chunk_text,
+               text = text,
+               row = dashdata$current_row,
+               all_entities = dashdata$rawdata[dashdata$rawdata$doc_id %in% doc_id, ],
+               total_rows = nrow(dashdata$rawdata))
+  info
+})
+```
+
+```{r}
+actionButton("ui_save", label = "Bewaar", width = "100%", class = "btn-success", icon = icon("save"))
+tags$hr()
+materialSwitch(inputId = "ui_isgeneriekelocatie", label = "Als generieke locatie", status = "success", 
+               value = TRUE, width = "100%", right = TRUE)
+tags$hr()
+actionButton("ui_dontknow", label = "Onmogelijk te geocoderen", width = "100%", icon = icon("save"))
+tags$hr()
+observeEvent(input$ui_dontknow, {
+  isolate({
+    modus <- input$ui_testmodus
+  })
+  isolate({
+    geom <- currentText()
+    geom$annotation_time <- Sys.time()
+    geom$doc_id <- geom$doc_id
+    geom$chunk_id <- geom$chunk_id
+    geom$chunk_text <- geom$chunk_text
+    geom$text <- geom$text
+    geom$type <- "zelfgedefinieerd-spatiaal-object"
+    geom$shape_id <- NA_character_
+    geom$LABEL <- NA_character_
+    geom$radius <- NA_character_
+  })
+  x <- geom[c("type", "shape_id", "LABEL", "radius", "annotation_time", "doc_id", "chunk_id", "chunk_text", "text")]
+  x <- as.data.frame(x)
+  save_annotation(x, modus, comment = "onmogelijk te geocoderen")
+  clickedsave(clickedsave() + 1) 
+})
+```
+
+#### Zoom
+
+```{r}
+prettyRadioButtons(
+  inputId = "ui_focal_area_grp", label = "Focus op", 
+  choices = c("Brugse binnenstad" = "bruggecentrum", 
+              "Brugge" = "brugge", 
+              "Brugge en omgeving" = "brugge_omgeving", 
+              "West-Vlaanderen" = "westvlaanderen",
+              "Vlaanderen" = "vlaanderen"), selected  = "brugge_omgeving",
+  shape = "round", status = "danger", fill = TRUE, inline = TRUE, animation = "pulse")
+```
+
+#### Zoek in ...
+
+```{r}
+# searchInput(
+#   inputId = "ui_geocode_zoek", 
+#   label = "Zoek", 
+#   placeholder = "Brugge", 
+#   btnSearch = icon("search"), 
+#   width = "100%"
+# )
+textInput(inputId = "ui_geocode_zoektext", 
+          label = "Zoek", value = "Brugge", width = "100%")
+# prettyRadioButtons(
+#   inputId = "ui_laag", label = "Laag", 
+#   choices = c("Statistische sectoren nu" = "statistical_sectors", 
+#               "Popp" = "popp", 
+#               "Magis" = "magis", 
+#               "Straten Brugge" = "stratenbrugge",
+#               "Huizen Brugge" = "huizenbrugge"), 
+#   selected  = "statistical_sectors",
+#   thick = TRUE, bigger = TRUE,
+#   shape = "round", status = "danger", fill = TRUE, inline = TRUE, animation = "pulse")
+
+pickerInput(
+  inputId = "ui_laag", 
+  label = "Waarin", 
+  choices = c(
+              "Gemeenten in 1830" = "gemeenten_1830",
+              "Gemeente-centra (kerk) in 1801" = "gemeentecentra_1801",
+              "Plannen 17e eeuw (Ward/Heidi)" = "straten_17de_eeuw",
+              "Popp" = "popp", 
+              "Magis (huizen)" = "erfgoed_magis", 
+              "Stedenatlas Brugge" = "stedenatlas_brugge", 
+              "Huidige provincies" = "statistical_provincies",
+              "Huidige gemeentes" = "statistical_gemeentes", 
+              "Huidige statistische sectoren" = "statistical_sectors",
+              "Eigen spatiale objecten" = "manual"), 
+  selected  = c("gemeenten_1830", "gemeentecentra_1801"),
+  #selected  = c("gemeenten_1830"),
+  options = list(
+    `actions-box` = TRUE, 
+    size = 10,
+    `selected-text-format` = "count > 3"
+  ), 
+  multiple = TRUE
+)
+
+# checkboxGroupButtons(
+#   inputId = "ui_laag",
+#   label = "Laag",
+#   choices = c("Statistische sectoren nu" = "statistical_sectors", 
+#               "Popp" = "popp", 
+#               "Magis" = "magis", 
+#               "Straten Brugge" = "stratenbrugge",
+#               "Huizen Brugge" = "huizenbrugge"),
+#   selected = "statistical_sectors"#,
+#   #status = "info",
+#   #direction = "vertical",
+#   #checkIcon = list(yes = icon("check-square"), no = icon("square-o")),
+#   #checkIcon = list(yes = icon("ok", lib = "glyphicon"), no = icon("remove", lib = "glyphicon")),
+#   #justified  = FALSE
+# )
+#actionButton("ui_geocode_zoek", label = "Zoek", width = "100%", class = "btn-info", icon = icon("search"))
+tags$hr()
+```
+
+#### Achtergrondkaart
+
+```{r}
+awesomeRadio(
+   inputId = "ui_background",
+   label = "",
+   choices = rev(c(
+               #"Masse (1729-1730)" = "Masse", 
+               #"Frickx (1744)" = "frickx", 
+               #"Villaret (1745-1748)" = "Villaret", 
+               "Ferraris (1777)" = "ferraris", 
+               "Atlas der Buurtwegen (1840)" = "abw", 
+               "Popp (1842-1879)" = "popp", 
+               "Vandermaelen (1846-1854)" = "vandermaelen",
+               "Geen" = "geen")), 
+   selected  = "geen",
+   status = "success"
+)
+```
+
+```{r}
+tags$hr()
+actionButton("ui_show", label = "Show the geocoded data", width = "100%")
+tags$hr()
+downloadBttn("ui_download", label = "Download data")
+tags$hr()
+observeEvent(input$ui_show, {
+  x     <- read_annotations()
+  x     <- subset(x, !comment %in% "gazetteer")
+  x     <- x[order(x$annotation_time, decreasing = TRUE), ]
+  
+  buttonInput <- function(FUN, len, id, ...) {
+    inputs <- character(len)
+    for (i in seq_len(len)) {
+      inputs[i] <- as.character(FUN(paste0(id, i), ...))
+    }
+    inputs
+  }
+  
+  x$row <- seq_len(nrow(x))
+  dashdata$locations_geocoded <<- x
+  if(nrow(x) > 0){
+     # if(inherits(x, "sf")){
+     #   x <- as_Spatial(x)
+     #   x <- x@data  
+     # }
+    x$geometry <- NULL
+    #x$Action <- buttonInput(FUN = actionButton, len = nrow(x), id = 'button_', label = "Delete", onclick = 'Shiny.onInputChange(\"deleterow\", this.id)')
+    x$Action <- buttonInput(FUN = actionButton, len = nrow(x), id = 'button_', label = "Delete", onclick = 'Shiny.setInputValue(\"deleterow\", this.id, {priority: "event"})')
+    x <- x[, c("Action", "annotation_time", "doc_id", "chunk_text", "shape_id", "type", "label")]
+    dt <- datatable(x, rownames = FALSE, extensions = c('Buttons', 'Responsive'), escape = FALSE, 
+                    options = list(dom = 'Bfrtip', buttons = list(list(extend = 'colvis', columns = c(1, 4, 5, 6))),
+                                   columnDefs = list(list(visible=FALSE, targets = c(4, 5)))))
+    showModal(modalDialog(renderDataTable(dt), size = "l", easyClose = TRUE))
+  }
+}, ignoreInit = TRUE)
+observeEvent(input$deleterow, {
+    selectedRow <- as.integer(strsplit(input$deleterow, "_")[[1]][2])
+    x <- subset(dashdata$locations_geocoded, row %in% selectedRow)
+    if(nrow(x) > 0){
+      delete_annotation(x)
+      removeModal()
+      dashdata$current_row <<- 0
+      clickedsave(0) 
+    }
+})
+shp_to_zip <- function(x, filename, SHP_EXTENSIONS = c("dbf", "prj", "shp", "shx")) {
+  filename <- gsub(filename, pattern = ".zip$", replacement = ".shp")
+  sf::write_sf(obj = x, dsn = filename)
+  shp_basename  <- gsub("\\.shp$", "", filename)
+  shp_filenames <- sprintf("%s.%s", shp_basename, SHP_EXTENSIONS)
+  zipname <- sprintf("%s.zip", shp_basename)
+  zip::zipr(zipfile = zipname, files = shp_filenames)
+  zipname
+}
+output$ui_download <- downloadHandler(
+    filename = function() {
+      paste("geocoded-locations-", format(Sys.time(), "%Y%m%d%H%M%S"), ".zip", sep = "")
+    },
+    content = function(file){
+      try({
+        x <- read_annotations()
+        if(nrow(x) > 0){
+          if(inherits(x, "sf")){
+            path <- tempfile(pattern = "locations-", fileext = ".zip")
+            shp <- x[sapply(x$geometry, length) > 0, ]
+            shp_to_zip(shp, filename = path)
+            file.copy(path, file)
+            path <- tempfile(pattern = "locations-", fileext = ".csv")
+            x$geometry <- NULL
+            write.csv(x, path, na = "", row.names = FALSE)
+            f <- gsub(".zip$", ".csv", file)
+            file.copy(path, f, overwrite = TRUE)
+            zip::zipr_append(file, f)
+          }else{
+            path <- tempfile(pattern = "locations-", fileext = ".csv")
+            write.csv(x, path, na = "", row.names = FALSE)
+            f <- gsub(".zip$", ".csv", file)
+            file.copy(path, f)
+            zip::zip(file, f, include_directories = FALSE)
+            file.remove(f)
+          }
+        }else{
+          path <- tempfile(pattern = "locations-", fileext = ".csv")
+          write.csv(data.frame(), path, na = "", row.names = FALSE)
+          f <- gsub(".zip$", ".csv", file)
+          file.copy(path, f)
+          zip::zip(file, f, include_directories = FALSE)
+          file.remove(f)
+        }
+      })
+    })
+
+observeEvent(input$ui_download, {
+  
+  
+}, ignoreInit = TRUE)
+```
+
+
+
+
+## Row {data-height=1000 .tabset .tabset-fade} 
+    
+### KAART (Historisch + Hedendaags) 
+
+```{r}
+basisKaart <- reactive({
+  focus <- input$ui_focal_area_grp
+  if(is.null(focus)){
+    focus <- "brugge_omgeving" 
+  }
+  kaart <- dashdata$maps$vlaanderen
+  basispolygonen <- dashdata$maps$basisachtergrond
+  if(focus == "bruggecentrum"){
+    kaart <- dashdata$maps$bruggecentrum
+    basispolygonen <- dashdata$maps$basisachtergrond_bruggecentrum
+  }else if(focus == "brugge"){
+    kaart <- dashdata$maps$brugge
+  }else if(focus == "brugge_omgeving"){
+    kaart <- dashdata$maps$brugge_omgeving
+  }else if(focus == "westvlaanderen"){
+    kaart <- dashdata$maps$westvlaanderen
+  }else if(focus == "vlaanderen"){
+    kaart <- dashdata$maps$vlaanderen
+  }
+  bbox  <- dashdata$bbox[[focus]]
+  ok    <- gWithin(kaart, bbox, byid = TRUE, returnDense = FALSE)
+  ok    <- sapply(ok, FUN = function(x) any(x > 0))
+  kaart <- kaart[ok, ]
+  basispolygonen <- kaart
+ 
+  #kaart <- as_Spatial(kaart)
+  dashdata$kaart <<- kaart
+  m <- leaflet(data = kaart) 
+  m <- addPolygons(m, layerId = kaart$shape_id, weight = 0, fill = FALSE, fillOpacity = 0.05, 
+                   label = ~LABEL, group = "basiskaart", data = kaart)
+  list(map = m, basispolygonen = basispolygonen, bbox = bbox)
+  
+})
+highlight_most_similar <- reactiveValues(data = character())
+
+editModUI(id = "map")
+updateMap <- observe({
+  aantal <- clickedsave()
+  cat(sprintf("Aantal annotaties: %s", aantal), sep = "\n")
+  achtergrond <- input$ui_background
+  if(is.null(achtergrond)){
+    achtergrond <- "vandermaelen" 
+  }
+  lagen <- input$ui_laag
+  highlight_element <- highlight_most_similar$data
+  
+  
+  maps <- basisKaart()
+  m <- maps$map
+  
+  # showModal(
+  #   modalDialog(title = "Updating maps", "Please wait, popup will close automatically when done",
+  #               easyClose = FALSE, footer = NULL))  
+  if("statistical_gemeentes" %in% lagen){
+    areas <- gWithin(dashdata$maps$statistical_gemeentes, maps$bbox, byid = TRUE, returnDense = FALSE)
+    areas <- sapply(areas, FUN = function(x) any(x > 0))
+    areas <- dashdata$maps$statistical_gemeentes[areas, ]
+    if(nrow(areas) > 0)
+    m <- addPolygons(m, data = areas, group = "statistical_gemeentes", 
+                     layerId = ~shape_id, weight = 1, fill = TRUE, fillOpacity = 0, label = ~LABEL)
+  }
+  if("statistical_sectors" %in% lagen){
+    areas <- gWithin(dashdata$maps$statistical_sectors, maps$bbox, byid = TRUE, returnDense = FALSE)
+    areas <- sapply(areas, FUN = function(x) any(x > 0))
+    areas <- dashdata$maps$statistical_sectors[areas, ]
+    if(nrow(areas) > 0)
+    m <- addPolygons(m, data = areas, group = "statistical_sectors", 
+                     layerId = ~shape_id, weight = 1, fill = TRUE, fillOpacity = 0, label = ~LABEL)
+  }
+  if("statistical_provincies" %in% lagen){
+    areas <- dashdata$maps$statistical_provincies
+    m <- addPolygons(m, data = areas, group = "statistical_provincies", 
+                     layerId = ~shape_id, weight = 1, fill = TRUE, fillOpacity = 0, label = ~LABEL)
+  }
+  if("gemeenten_1830" %in% lagen){
+    bbox  <- maps$bbox
+    bbox@proj4string <- dashdata$maps$gemeenten_1830@proj4string
+    areas <- gWithin(dashdata$maps$gemeenten_1830, bbox, byid = TRUE, returnDense = FALSE)
+    areas <- sapply(areas, FUN = function(x) any(x > 0))
+    areas <- dashdata$maps$gemeenten_1830[areas, ]
+    m <- addPolygons(m, data = areas, group = "gemeenten_1830", color = "orange",
+                     layerId = ~shape_id, label = ~LABEL, weight = 5, fill = TRUE, fillOpacity = 0.2)
+  }
+
+  if("erfgoed_magis" %in% lagen){
+    m <- addCircles(m, data = dashdata$maps$erfgoed_magis, group = "erfgoed_magis", layerId = ~shape_id, label = ~LABEL, radius = 5, col = "blue")
+    #m <- addPolygons(m, data = dashdata$maps$erfgoed_magis, group = "erfgoed_magis", 
+    #                 layerId = ~shape_id, label = ~LABEL, weight = 1, fill = TRUE, fillOpacity = 0.1)
+  }
+  if("stedenatlas_brugge" %in% lagen){
+    m <- addCircles(m, data = dashdata$maps$stedenatlas_brugge, group = "stedenatlas_brugge", layerId = ~shape_id, label = ~LABEL, radius = 5, col = "blue")
+    #m <- addPolygons(m, data = dashdata$maps$erfgoed_magis, group = "erfgoed_magis", 
+    #                 layerId = ~shape_id, label = ~LABEL, weight = 1, fill = TRUE, fillOpacity = 0.1)
+  }
+  if("gemeentecentra_1801" %in% lagen){
+    bbox  <- maps$bbox
+    bbox@proj4string <- dashdata$maps$gemeentecentra_1801@proj4string
+    areas <- gWithin(dashdata$maps$gemeentecentra_1801, bbox, byid = TRUE, returnDense = FALSE)
+    areas <- sapply(areas, FUN = function(x) any(x > 0))
+    areas <- dashdata$maps$gemeentecentra_1801[areas, ]
+    m <- addCircles(m, data = areas, group = "gemeentecentra_1801", layerId = ~shape_id, label = ~LABEL, radius = 10, col = "red")
+  }
+  if("popp" %in% lagen){
+    #m <- addPolygons(m, data = dashdata$maps$popp, group = "popp", 
+    #                 layerId = ~shape_id, label = ~LABEL, weight = 1, fill = TRUE, fillOpacity = 0.1, color = "red")
+    m <- addGlPolygons(m, data = dashdata$maps$popp, group = "popp", stroke = TRUE,
+                     #layerId = ~shape_id, #popup = ~LABEL, 
+                     layerId = dashdata$maps$popp$shape_id, #color = "red", fillColor = cbind(0, 0.2, 1),
+                     weight = 3, fillOpacity = 0.5)
+    
+    areas <- subset(dashdata$maps$popp, grepl(shape_type, 
+                                              pattern = "molen|brug|rust/zorg|religieus|onderwijs|publiek", ignore.case = TRUE))
+    mycolorfun <- colorFactor(palette = "inferno", domain = areas$shape_type)
+    m <- addPolygons(m, data = areas, group = "popp", 
+                     color = ~mycolorfun(areas$shape_type), 
+                     #color = txt_recode(areas$shape_type, 
+                     #                   from = c("water", "gebouwen", "straten", "bouwblokken1670"), 
+                      #                  to = c("blue", "yellow", "purple", "red")), 
+                     layerId = ~shape_id, label = ~LABEL, weight = 1, fill = TRUE, fillOpacity = 0.6)
+    
+  }
+  if("straten_17de_eeuw" %in% lagen){
+    areas <- subset(dashdata$maps$straten_17de_eeuw, shape_type %in%  "parochies")
+    m <- addPolygons(m, data = areas, group = "straten_17de_eeuw", color = "grey", layerId = ~shape_id, label = ~LABEL, 
+                     weight = 1, fill = TRUE, fillOpacity = 0.3)
+    areas <- subset(dashdata$maps$straten_17de_eeuw, shape_type %in%  c("water", "gebouwen", "straten", "bouwblokken1670"))
+    mycolorfun <- colorFactor(palette = "RdYlBu", domain = dashdata$maps$straten_17de_eeuw$shape_type)
+    m <- addPolygons(m, data = areas, group = "straten_17de_eeuw", 
+                     #color = ~mycolorfun(areas$shape_type), 
+                     color = txt_recode(areas$shape_type, 
+                                        from = c("water", "gebouwen", "straten", "bouwblokken1670"), 
+                                        to = c("blue", "yellow", "purple", "red")), 
+                     layerId = ~shape_id, label = ~LABEL, weight = 1, fill = TRUE, fillOpacity = 0.3)
+    # m <- addLayersControl(m, baseGroups = c("OSM (default)", "Toner", "Toner Lite"), overlayGroups = c("Quakes", "Outline"),
+    #                       position = "bottomleft",
+    #                       options = layersControlOptions(collapsed = FALSE))
+  }
+  if("manual" %in% lagen){
+    if(!is.null(dashdata$maps$manual_points)){
+      m <- addCircles(m, data = dashdata$maps$manual_points, group = "manual_points", layerId = ~shape_id, label = ~LABEL, radius = 20, col = "red", weight = 5)
+    }
+    if(!is.null(dashdata$maps$manual_polygons)){
+      m <- addPolygons(m, data = dashdata$maps$manual_polygons, group = "manual_polygons", color = "red", layerId = ~shape_id, label = ~LABEL, 
+                      weight = 1, fill = TRUE, fillOpacity = 0.3)
+    }
+    if(!is.null(dashdata$maps$manual_lines)){
+      m <- addPolylines(m, data = dashdata$maps$manual_lines, group = "manual_lines", color = "red", layerId = ~shape_id, label = ~LABEL, 
+                          weight = 1, fill = TRUE, fillOpacity = 0.3)
+    }
+    # areas                <- read_manual_annotations()
+    # if(nrow(areas) > 0){
+    #   areas$geom_type <- as.character(st_geometry_type(areas))
+    #   areas           <- split(areas, areas$geom_type)
+    #   if("POINT" %in% names(areas)){
+    #     dashdata$maps$manual_points <<- as_Spatial(areas$POINT)
+    #     
+    #   }else{
+    #     dashdata$maps$manual_points <<- NULL
+    #   }
+    #   if("POLYGON" %in% names(areas)){
+    #     dashdata$maps$manual_polygons <<- as_Spatial(areas$POLYGON)
+    #     
+    #   }else{
+    #     dashdata$maps$manual_polygons <<- NULL
+    #   }
+    #   if("LINESTRING" %in% names(areas)){
+    #     dashdata$maps$manual_lines <<- as_Spatial(areas$LINESTRING)
+    #     
+    #   }else{
+    #     dashdata$maps$manual_lines <<- NULL
+    #   }
+    # }
+  }
+  
+  if(length(highlight_element) > 0){
+    #print(highlight_element)
+    highlight_element <- lapply(dashdata$maps, FUN=function(x){
+      subset(x, shape_id %in% highlight_element)
+    })
+    try({
+      grp <- head(names(highlight_element)[sapply(highlight_element, nrow) > 0], n = 1)
+      highlight_element <- highlight_element[[grp]]
+      if(grp %in% "manual_lines" && inherits(highlight_element, "SpatialLinesDataFrame")){
+        m <- addPolylines(m, data = highlight_element, group = grp, color = "red", layerId = ~shape_id, label = ~LABEL, weight = 20) 
+      }else {
+        if(grp %in% c("gemeentecentra_1801", "erfgoed_magis", "manual_points") || inherits(highlight_element, "SpatialPointsDataFrame")){
+          #print(highlight_element)
+          m <- addCircles(m, data = highlight_element, group = grp, layerId = ~shape_id, label = ~LABEL, radius = 20, col = "red", weight = 20)
+        }else{
+          m <- addPolygons(m, data = highlight_element, group = grp, color = "red", layerId = ~shape_id, label = ~LABEL, weight = 10, fill = TRUE, fillOpacity = 0.2) 
+        }
+      }
+    })
+  }
+  m <- addMapPane(m, name = "left", zIndex = 0) 
+  m <- addMapPane(m, name = "right", zIndex = 0) 
+  m <- addTiles(m, layerId = "baseid", group = "base", options = pathOptions(pane = "right", minZoom = 1, maxZoom = 20))
+  options = providerTileOptions(minZoom = 8, maxZoom = 10)
+  if(!achtergrond %in% "geen"){
+   m <- addWMSTiles(m, baseUrl = dashdata$wms_link, 
+                   #layers = "vandermaelen",
+                   #layers = "abw",
+                   layers = achtergrond,
+                   layerId = "historisch_id",
+                   options = c(WMSTileOptions(format = "image/png", #CRS = "EPSG:3812", 
+                                              transparent = TRUE),
+                               pathOptions(pane = "left"))) 
+  }
+  m <- addSidebyside(m, layerId = "sidecontrols", rightId = "baseid", leftId = "historisch_id",
+                     options = list(thumbSize = 100))
+  m <- addSearchFeatures(m, 
+                         targetGroups = c("statistical_provincies", "statistical_gemeentes", "statistical_sectors", 
+                                          "straten_17de_eeuw", "gemeenten_1830", "gemeentecentra_1801",
+                                          "popp", "erfgoed_magis"),
+                         options = searchFeaturesOptions(zoom = 16, openPopup = TRUE, firstTipSubmit = TRUE,
+                                                         autoCollapse = TRUE, hideMarkerOnCollapse = FALSE,
+                                                         textPlaceholder = "Zoek in je geselecteerde lagen"))
+  m <- addControl(m, "<b>Hint! Zoek hier</b>", position = "topleft")
+
+
+  # addSearchFeatures(
+  #   targetGroups = "pop_density",
+  #   options = searchFeaturesOptions(
+  #     propertyName = "NAME", zoom = 2, openPopup = TRUE, firstTipSubmit = TRUE,
+  #     autoCollapse = FALSE, hideMarkerOnCollapse = TRUE )) %>%
+  # 
+  m <- addSearchOSM(m, options = searchOptions(autoCollapse = TRUE, minLength = 2))
+  m <- addPmToolbar(map = m, targetLayerId = "", targetGroup = "",
+                    toolbarOptions = pmToolbarOptions(position = "topright", 
+                                                      drawMarker = TRUE,
+                                                      drawPolygon = TRUE,
+                                                      drawPolyline  = TRUE,
+                                                      cutPolygon = FALSE, 
+                                                      drawRectangle = FALSE,
+                                                      editMode = FALSE,
+                                                      removalMode = TRUE,
+                                                      drawCircle = TRUE), drawOptions = pmDrawOptions(),
+                    editOptions = pmEditOptions(), cutOptions = pmCutOptions())
+  geocoded_locations <<- callModule(editMod, leafmap = m, id = "map")
+  #removeModal()
+  dashdata$geselecteerde_kaarten <<- lagen
+  geocoded_locations
+})
+kaart_selectie <- function(id, kaart){
+  #print(kaart)
+  x <- dashdata$maps[[kaart]]
+  if(length(x) == 0){
+    out <- list(id = id, label = "")
+    showModal(modalDialog("Selecteer een groter bereik eerst"))
+  }else{
+    x <- subset(x, shape_id %in% id)
+    if(nrow(x) > 0){
+      out <- list(id = x$shape_id, label = x$LABEL)  
+    }else{
+      out <- list(id = id, label = "")
+    } 
+  }
+  out <- lapply(out, head, n = 1)
+  out$map <- x
+  out
+}
+
+selectie_laatste_regular <- reactive({
+  i <- input$`map-map_shape_click`
+  list(id = i$id, group = i$group, at = Sys.time(), ok = !is.null(i$id))
+})
+selectie_laatste_glify <- reactive({
+  i <- input$`map-map_glify_click`
+  list(id = i$id, group = i$group, at = Sys.time(), ok = !is.null(i$id))
+})
+selectie_laatste_click <- reactive({
+  regular <- selectie_laatste_regular()
+  glify   <- selectie_laatste_glify()
+  if(regular$ok && glify$ok){
+    if(regular$at < glify$at){
+      glify
+    }else{
+      regular
+    }
+  }else if(regular$ok){
+    regular
+  }else if(glify$ok){
+    glify
+  }else{
+    return(list(ok = FALSE))
+  }
+})
+
+selectie_bestaande_shape <- reactive({
+  #print(str(input$`map-map_glify_click`$id))
+  #print(str(input$`map-map_shape_click`$id))
+  #event <- input$`map-map_shape_click`
+  event <- selectie_laatste_click()
+  info <- list()
+  if(!event$ok){
+    return(info)
+  }
+  # if(is.null(event)){
+  #   return(info)
+  # }
+  info <- kaart_selectie(event$id, event$group)
+  info$group <- unique(event$group)
+  isolate({
+    chunk_text <- currentText()
+  })
+  info$doc_id <- chunk_text$doc_id  
+  info$chunk_id <- chunk_text$chunk_id
+  info$chunk_text <- chunk_text$chunk_text  
+  info$text <- chunk_text$text
+  info$lat <- event$lat
+  info$lon <- event$lng
+  #print(str(info))
+  info
+})
+observe({
+  input$`map-map_shape_click`
+  input$`map-map_glify_click`
+  isolate({
+    info <- selectie_bestaande_shape()
+  
+  showModal(modalDialog(
+        title = "Bevestig je selectie",
+        tags$blockquote(info$chunk_text),
+        "Je selecteerde hiervoor volgende spatiale informatie, is dit de regio die je wil bewaren voor bovenstaande tekst?",
+        tags$ul(
+          tags$li(sprintf("ID: %s", info$id)), 
+          tags$li(info$label)), 
+        size = "m", easyClose = TRUE,
+        footer = tagList(
+          modalButton("Nee"),
+          actionButton(inputId = "selectie_bevestig", label = "Ja")
+        )
+      ))
+  #confirmSweetAlert(session, title = "Dit is inderdaad de regio om te bewaren?", text = event$id, inputId = "myconfirmation")
+  ## s
+  })
+  
+})
+observeEvent(input$selectie_bevestig, {
+  selectie <- selectie_bestaande_shape()
+  selectedspatialobjects$data <<- selectie
+  removeModal()
+})
+# observeEvent(input$myconfirmation, {
+#   if(isTRUE(input$myconfirmation)) {
+#     print("Confirming")
+#   }else{
+#   }
+# }, ignoreNULL = TRUE)
+# go <- reactive({
+#   aantal <- clickedsave()
+#   input$ui_background
+#   input$ui_focal_area_grp
+#   updateMap()
+#   aantal
+# })
+# test <- reactive({
+#   input$ui_save
+#   #clickedsave(clickedsave() + 1) 
+#   getMap()
+# })
+observeEvent(input$ui_save, {
+  locatie <- selectedspatialobjects$data
+  geom <- geocoded_locations()$finished
+  geom <- tail(geom, n = 1)
+  if(length(locatie) > 0){
+    #saveRDS(locatie, file = "C:/Users/Jan/Desktop/locatie.rds")
+    geom               <- st_as_sf(locatie$map)
+    geom$type          <- "gekend-spatiaal-object"
+    geom               <- geom[, c("type", "shape_id", "LABEL"), drop = FALSE]
+    geom$radius        <- NA_real_
+    geom$spatial_map   <- locatie$group
+    geom$spatial_id    <- locatie$id
+    geom$spatial_label <- locatie$label
+    #geom$geometry <- sapply(geom$geometry, FUN=function(x) NULL)
+    #geom <- as_Spatial(geom)
+    #geom <- st_as_sf(ms_simplify(geom))
+    geom$geometry <- NULL
+    #print(str(geom))
+  }else{
+    #saveRDS(geom, file = "C:/Users/Jan/Desktop/geom.rds")
+    if(!"radius" %in% colnames(geom)){
+      geom$radius        <- NA_real_
+    }
+    geom$type          <- "manual"
+    geom$LABEL         <- NA_character_
+    geom$shape_id      <- sprintf("handmade::%s", geom$edit_id)
+    geom               <- geom[, c("type", "shape_id", "LABEL", "radius"), drop = FALSE]
+    geom$spatial_map   <- NA_character_
+    geom$spatial_id    <- NA_character_
+    geom$spatial_label <- NA_character_
+  }
+  ##
+  ## Saving to the DB?
+  ##
+  isolate({
+    info <- currentText()
+    geom$annotation_time <- Sys.time()
+    geom$doc_id <- info$doc_id
+    geom$chunk_id <- info$chunk_id
+    geom$chunk_text <- info$chunk_text
+    geom$text <- info$text
+  })
+  isolate({
+    modus <- input$ui_testmodus
+  })
+  if(nrow(geom) > 0){
+    showModal(modalDialog("Saving the object to the DB. Wait a minute. I'll close myself when finished.", 
+                          footer = NULL, easyClose = FALSE))
+    
+    geom$is_generieke_locatie <- rep(input$ui_isgeneriekelocatie, nrow(geom))
+    ok <- try({
+      save_annotation(geom, modus)
+      if(any(geom$type %in% "manual")){
+        update_maps_manual()  
+      }
+    })
+    removeModal()
+    if(inherits(ok, "try-error")){
+      showNotification(as.character(attributes(ok)$condition))  
+    }else{
+      showNotification("Thanks. Stored in the database.")  
+    }
+    
+  }
+  output$ui_geotags <- renderPrint({
+    geom
+  })
+  clickedsave(clickedsave() + 1) 
+  selectedspatialobjects$data <- NULL
+})
+#leafletOutput("map")
+#dashdata$edits <<- callModule(editMod, leafmap = m, id = "map")
+
+# counterServer <- function(id) {
+#   moduleServer(id, editMod)
+# }
+#editModUI(id = "map")
+#edit <- callModule(editMod, "map", )
+## editModUI is leafletoutput
+## editMod is reactive
+```
+
+
+
+## Row {.tabset .tabset-fade}
+
+
+### Meest gelijkaardige locaties
+
+
+```{r}
+shinyInput <- function(FUN, len, id, ...) {
+  inputs <- character(len)
+  for (i in seq_len(len)) {
+    inputs[i] <- as.character(FUN(paste0(id, i), ...))
+  }
+  inputs
+}
+most_similar <- reactiveValues(data = data.frame(shape_id = character(), 
+                                                 LABEL = character(), 
+                                                 toon = character(), stringsAsFactors = FALSE))
+
+DT::renderDataTable({
+  zoekterm <- input$ui_geocode_zoek
+  zoekterm <- input$ui_geocode_zoektext
+  
+  lagen <- input$ui_laag
+  if("manual" %in% lagen){
+    lagen <- unique(c(lagen, c("manual_points", "manual_polygons", "manual_lines")))
+  }
+  lagen <- intersect(lagen, names(dashdata$maps))
+  if(length(lagen) > 0){
+    spat <- dashdata$maps[lagen]
+    spat <- lapply(spat, as.data.frame)
+    spat <- lapply(spat, FUN = function(x) x[, c("shape_id", "LABEL")])
+    spat <- rbindlist(spat)  
+  }else{
+    spat <- data.frame(shape_id = character(), LABEL = character(), stringsAsFactors = FALSE)
+  }
+  spat$dist <- stringdist(tolower(zoekterm), tolower(spat$LABEL), method = "lcs", weight = c(d = 0.01, i = 1, s = 1, t = 1))
+  spat <- subset(spat, !is.na(dist))
+  spat <- spat[order(spat$dist, decreasing = FALSE), ]
+  spat <- head(spat, n = 50)
+  spat$toon <- shinyInput(actionButton, len = nrow(spat), id = 'button_', label = "Toon locatie", 
+                          onclick = 'Shiny.onInputChange(\"select_button\",  this.id, {priority: "event"})',
+                          icon = icon("search"))
+  most_similar$data <<- spat
+  head(spat, n = 50)
+}, server = FALSE, escape = FALSE, selection = 'none', 
+options = list(pageLength = 3, rownames = NULL))
+
+observeEvent(input$select_button, {
+  row <- strsplit(input$select_button, "_")
+  row <- unlist(row)
+  row <- tail(row, 1)
+  row <- as.numeric(row)
+  x <- most_similar$data
+  highlight_most_similar$data <<- x$shape_id[row]
+})
+```
+
+
+### Getuigenis
+
+```{r}
+htmlOutput("ui_txt")
+tags$style(type="text/css", "#ui_txt {white-space: pre-wrap; overflow-y: auto;}")
+output$ui_txt <- renderUI({
+  input$ui_save
+  info <- currentText()
+  chunk_text <- info$chunk_text
+  text       <- info$text
+  
+  lookup <- chunk_text
+  lookup <- paste(info$all_entities$chunk_text, collapse = "|")
+  p <- gregexpr(pattern = lookup, text = text, ignore.case = TRUE)
+  
+  #regmatches(text, m = p) <- sprintf("<b>%s</b>", lookup)
+  #regmatches(text, m = p) <- sprintf("<b>%s</b>", p(lookup, style = "color:red"))
+  #regmatches(text, m = p) <- sprintf('<font color=\"#FF0000\"><b>%s</b></font>', lookup)
+  #regmatches(text, m = p) <- sprintf('<font color=\"#FF0000\"><b>%s</b></font>', lookup)
+  found <- regmatches(text, m = p)
+  found <- lapply(found, FUN = function(x) sprintf('<font color=\"#FF0000\"><b>%s</b></font>', x))
+  regmatches(text, m = p) <- found
+  
+  
+  list(subject = tags$blockquote(chunk_text), 
+       #content = tags$span(style="white-space: pre", text))
+       content = tags$span(text))
+  list(subject = tags$blockquote(chunk_text), 
+       #content = tags$span(style="white-space: pre", text))
+       content = HTML(text))
+})
+```
+
+    
+### De laatste gesavede data
+
+```{r}
+verbatimTextOutput(outputId = "ui_geotags")
+```
+
+# Data
+
+## LOAD
+
+### Laad een nieuwe set van documenten op
+
+```{r}
+tags$blockquote("Laadt hier een set van documenten en text chunks op zodat je die kan taggen.")
+```
+
+```{r}
+fileInput(inputId = "ui_tid_input", label = "Selecteer je .rds bestand",   buttonLabel = "Browse...", width = "100%")
+#tags$hr()
+#library(shinyFiles)
+# renderUI({
+#   shinyFilesButton("file_choose", "Select file", "", multiple = FALSE)
+#   })
+# shinyFileChoose(input, "file_choose", roots = c(home = '~'))
+```
+
+<details>
+<summary>Klik hier voor meer informatie over de structuur van deze op te laden data</summary>
+Deze set van documenten moet een data.frame zijn met de kolommen doc_id, chunk_id en chunk_text en optioneel een text veld die de context weergeeft van
+de text chunk. Je moet dit bestand saven met saveRDS of write.csv. Een voorbeeld staat hieronder. Na opladen van de text chunks, kan je beginnen geocoderen.
+```{r, echo=TRUE, eval=FALSE}
+x <- data.frame(doc_id = c("doc1", "doc2", "doc2"), 
+                chunk_id = c(1, 1, 2),
+                chunk_text = c("Steenstraat", "Taj Mahal", "Mount Everest"),
+                text = c("We gingen naar de Steenstraat shoppen", 
+                         "I went to see the Taj Mahal after climbing the Mount Everest",
+                         "I went to see the Taj Mahal after climbing the Mount Everest"), 
+                stringsAsFactors = FALSE)
+saveRDS(x, file = "to_annotate.rds")
+write.csv(x, file = "to_annotate.csv", row.names = FALSE)
+```
+</details>
+
+
+### OPGELADEN DATA
+
+```{r}
+dataTableOutput(outputId = "ui_rawdata")
+reactive({
+  input$ui_tid_input
+  #print(input$ui_tid_input$name)
+  if(!is.null(input$ui_tid_input) && file.exists(input$ui_tid_input$datapath)){
+    if(tools::file_ext(input$ui_tid_input$name) %in% c("rds", "RDS", "Rds", "txt", "csv")){
+      dashdata$save_as <<- sprintf("tagged_%s_%s.rds", format(Sys.time(), "%Y%m%d_%H%M%S"), gsub(".rds$|.RDS$", "", input$ui_tid_input$name))
+      filetype <- file_ext(input$ui_tid_input$name)
+      if(filetype %in% c("txt", "csv")){
+        dashdata$rawdata <<- setDF(fread(input$ui_tid_input$datapath))
+      }else{
+        dashdata$rawdata <<- readRDS(input$ui_tid_input$datapath)   
+      }
+      dashdata$filenaam <<- basename(input$ui_tid_input$name)
+      
+      if(inherits(dashdata$rawdata, "data.frame") && all(c("doc_id", "chunk_id", "chunk_text") %in% colnames(dashdata$rawdata))){
+         already  <- read_annotations(with_filters = FALSE)
+         already  <- subset(already, modus == "prod")
+         generiek <- already$chunk_text[already$comment %in% "gazetteer"]
+         already  <- subset(already, datasource == dashdata$filenaam)
+         generiek <- c(generiek, already$chunk_text[which(already$is_generieke_locatie == TRUE)])
+         generiek <- unique(generiek)
+         dashdata$rawdata$is_done <<- ifelse(dashdata$rawdata$chunk_text %in% generiek, TRUE, 
+                                             ifelse(paste(dashdata$rawdata$doc_id, dashdata$rawdata$chunk_id, dashdata$rawdata$chunk_text, sep = "_") %in%
+                                                      paste(already$doc_id, already$chunk_id, already$chunk_text, sep = "_"), TRUE, FALSE))
+      }
+
+      if(!inherits(dashdata$rawdata, "data.frame") || !all(c("doc_id", "chunk_id", "chunk_text") %in% colnames(dashdata$rawdata))){
+        showModal(modalDialog(title = "New data upload failed", "Uploaded data is not a data.frame with columns doc_id, chunk_id and chunk_text"))  
+      }else{
+        dashdata$current_row <<- 0
+        dashdata$total_rows  <<- nrow(dashdata$rawdata)
+        #current_rds(sprintf("newdata-%s", Sys.time()))
+        current_rds(dashdata$save_as)
+        gazetteer <- read_gazetteers()
+        if(nrow(gazetteer) > 0){
+          toshow         <- dashdata$rawdata
+          toshow$comment <- txt_recode(toshow$chunk_text, from = gazetteer$chunk_text, to = gazetteer$comment, na.rm = TRUE)
+          output$ui_rawdata <- renderDataTable(toshow[, c("doc_id", "chunk_id", "chunk_text", "comment", "is_done")], 
+                                               rownames = NULL,
+                                               options = list(pageLength = 15, lengthMenu = c(1, 2, 5, 10, 15, 20, 50, 100)))
+        }else{
+          output$ui_rawdata <- renderDataTable(dashdata$rawdata[, c("doc_id", "chunk_id", "chunk_text", "is_done")], 
+                                               rownames = NULL, options = list(pageLength = 15, lengthMenu = c(1, 2, 5, 10, 15, 20, 50, 100)))
+        }
+        showModal(modalDialog(title = "New data uploaded", 
+                              tags$ul(
+                              tags$li(sprintf("New data uploaded with %s rows", nrow(dashdata$rawdata)))#, 
+                              #tags$li(sprintf("Annotations will be saved in file: %s", dashdata$save_as)),
+                              #tags$li(sprintf("This file will be stored at folder %s", getwd()))
+                              )))  
+        update_maps_manual()
+      }  
+    }else{
+      showModal(modalDialog(title = "New data upload failed", "Uploaded data is not a .rds/.csv file"))  
+    }
+  }
+})
+```
+
+
+
+# Toon al uw werk
+
+## Inputs {.sidebar}
+
+#### Selecteer uw opgeladen bestand
+
+```{r}
+renderUI({
+  opts <- current_rds()
+  opts <- c(opts, read_datasources()$datasource)
+  opts <- unique(opts)
+  opts <- sort(opts)
+  selectInput(inputId = "ui_project", label = "Project", choices = opts)
+})
+actionButton(inputId = "ui_haal_annotaties", label = "Haal al je annotaties op", icon = icon("play"), width = "100%")
+tags$br()
+tags$br()
+materialSwitch(inputId = "ui_modus", label = "Test modus", status = "danger", value = FALSE)
+```
+
+## Uw data {data-height=1000 .tabset .tabset-fade} 
+    
+### Tabel
+
+```{r}
+DT::renderDataTable({
+  x <- haal_annotaties()
+  x$text <- NULL
+  x$geometry <- NULL
+  x$type <- NULL
+  x
+}, server = FALSE, escape = FALSE, selection = 'none', options = list(pageLength = 10, rownames = NULL))
+```
+
+### KAART (enkel objecten die 10x kleiner zijn dan de bounding box van de geocodering kaart die je in geocodeer locaties hebt aangevinkt)
+
+
+```{r}
+clean_spatial_annotations <- function(x){
+  if(.Platform$OS.type == "unix") {
+  }else {
+    x$shape_id <- gsub(pattern = "popp::popp::", replacement = "popp::", x = x$shape_id)
+  }
+  x$type <- ifelse(x$comment %in% "onmogelijk te geocoderen", NA, x$type)
+  fields <- c("annotation_time", "chunk_id", "chunk_text", "doc_id", "text",
+              "type", "spatial_map", "spatial_label", "spatial_type", "shape_id", "comment", "geometry")
+  #x <- x[, fields]
+  #x <- x[order(as.integer(x$chunk_id), decreasing = FALSE), ]
+  x <- x[order(x$annotation_time, decreasing = FALSE), ]
+  rownames(x) <- NULL
+
+  for(i in seq_len(nrow(x))){
+    if(st_is_empty(x$geometry[i])){
+      mapname <- x$spatial_map[i]
+      shape_identifier <- x$shape_id[i]
+      if(!is.na(mapname) && mapname %in% names(dashdata$maps)){
+        geom <- st_as_sf(subset(dashdata$maps[[mapname]], shape_id %in% shape_identifier))
+        if(nrow(geom) > 0){
+          geom <- geom$geometry[1]
+          x$geometry[i] <- geom  
+        }
+        
+      }
+    }
+  }
+  x$spatial_type <- st_geometry_type(x$geometry)
+  x <- x[, fields]
+  x
+}
+haal_annotaties <- reactive({
+  input$ui_haal_annotaties
+  isolate({
+    opt_datasource <- input$ui_project
+    opt_modus <- ifelse(input$ui_modus, "test", "prod")
+  })
+  x <- read_annotations(with_filters = FALSE)
+  x <- subset(x, datasource %in% opt_datasource & modus %in% opt_modus & !comment %in% "gazetteer")
+  x <- clean_spatial_annotations(x)
+  x
+})
+renderLeaflet({
+  locations <- haal_annotaties()
+  achtergrond <- input$ui_background
+  if(nrow(locations) > 0 && inherits(locations, "sf")){
+    maps <- basisKaart()
+    m <- maps$map
+    #m <- leaflet(data = dashdata$maps$brugge_omgeving)
+    m <- leaflet(data = locations) 
+    m <- addTiles(m)
+    locations$LABEL <- ifelse(is.na(locations$spatial_label), locations$chunk_text,
+                              paste(locations$chunk_text, locations$spatial_label, sep = " ==> "))
+    #saveRDS(locations, file = "C:/Users/Jan/Desktop/locations.rds")
+    #locations <- st_crop(locations, st_bbox(maps$bbox))
+    box <- st_as_sf(maps$bbox)
+    #mat <- st_within(locations, box)
+    #mat <- apply(mat, MARGIN = 1, FUN = any)
+    #mat <- mat & st_area(locations) < (st_area(box) / 10)
+    mat <- st_area(locations) < (st_area(box) / 10)
+    locations <- locations[mat, ]
+    #cat(sprintf("Already %s areas", nrow(locations)), sep = "\n")
+    areas     <- subset(locations, spatial_type %in% "POLYGON")
+    if(nrow(areas) > 0){
+      m <- addPolygons(m, data = areas, weight = 1, fill = TRUE, fillOpacity = 0.6, label = ~LABEL, color = "red")
+    }
+    areas <- subset(locations, spatial_type %in% "POINT")
+    if(nrow(areas) > 0){
+      m <- addCircles(m, data = areas, label = ~LABEL, radius = 3, col = "blue")
+    }
+    areas <- subset(locations, spatial_type %in% "LINESTRING")
+    if(nrow(areas) > 0){
+      m <- addPolylines(m, data = areas, color = "red", label = ~LABEL, weight = 1, fill = TRUE, fillOpacity = 0.3)
+    }
+    if(!achtergrond %in% "geen"){
+      m <- addWMSTiles(m, baseUrl = dashdata$wms_link, 
+                   layers = achtergrond,
+                   options = c(WMSTileOptions(format = "image/png", #CRS = "EPSG:3812", 
+                                              transparent = TRUE)))
+    }
+    m
+  }
+})
+```
+
