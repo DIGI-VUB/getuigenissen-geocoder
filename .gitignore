@@ -2,7 +2,11 @@
 .Rhistory
 .RData
 .Ruserdata
-.rds
-.xlsx
-.csv
-.txt
+*.RData
+*.rds
+*.xlsx
+*.csv
+*.txt
+*.parquet
+inceptions.R
+test-savedb.R
