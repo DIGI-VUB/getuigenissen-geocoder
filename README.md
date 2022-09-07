@@ -1,4 +1,4 @@
-*Historical geocoder*: Identify places of interest in 18th-19th century
+**Historical geocoder**: Identify places of interest in 18th-19th century
 
 - Upload texts with identified places, indicate the corresponding location in the the app
 - Similarities (suggestions show similar place at specific geo-level)
